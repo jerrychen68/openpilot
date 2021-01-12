@@ -42,7 +42,7 @@
 #endif
 
 #ifndef DISABLE_ENCODER
-#include "encoder.h"
+#include "omx_encoder.h"
 #endif
 
 constexpr int MAIN_BITRATE = 5000000;

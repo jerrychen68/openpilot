@@ -14,10 +14,18 @@ extern "C" {
 #include "common/cqueue.h"
 #include "visionipc.h"
 
-// encoder: lossey codec using hardware hevc
+// OmxEncoder, lossey codec using hardware hevc
+class OmxEncoder {
+public:
+  OmxEncoder(const char* filename, int width, int height, int fps, int bitrate, bool h265, bool downscale);
+  ~OmxEncoder();
+  int encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const uint8_t *v_ptr,
+                   int in_width, int in_height,
+                   int *frame_segment, VisionIpcBufExtra *extra);
+  void open(const char* path, int segment);
+  void close();
 
-
-struct EncoderState {
+private:
   pthread_mutex_t lock;
   int width, height, fps;
   const char* path;
@@ -59,13 +67,4 @@ struct EncoderState {
 
   bool downscale;
   uint8_t *y_ptr2, *u_ptr2, *v_ptr2;
-};
-
-void encoder_init(EncoderState *s, const char* filename, int width, int height, int fps, int bitrate, bool h265, bool downscale);
-int encoder_encode_frame(EncoderState *s,
-                         const uint8_t *y_ptr, const uint8_t *u_ptr, const uint8_t *v_ptr,
-                         int in_width, int in_height,
-                         int *frame_segment, VisionIpcBufExtra *extra);
-void encoder_open(EncoderState *s, const char* path, int segment);
-void encoder_close(EncoderState *s);
-void encoder_destroy(EncoderState *s);
+}
