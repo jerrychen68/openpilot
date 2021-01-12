@@ -22,16 +22,28 @@ public:
   int encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const uint8_t *v_ptr,
                    int in_width, int in_height,
                    int *frame_segment, VisionIpcBufExtra *extra);
-  void open(const char* path, int segment);
-  void close();
+  void encoder_open(const char* path, int segment);
+  void encoder_close();
+
+  static OMX_ERRORTYPE event_handler(OMX_HANDLETYPE component, OMX_PTR app_data, OMX_EVENTTYPE event,
+                                     OMX_U32 data1, OMX_U32 data2, OMX_PTR event_data);
+  static OMX_ERRORTYPE empty_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
+                                         OMX_BUFFERHEADERTYPE *buffer);
+  static OMX_ERRORTYPE fill_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
+                                        OMX_BUFFERHEADERTYPE *buffer);
+
+
 
 private:
+  // OMX callbacks
+  void wait_for_state(OMX_STATETYPE state);
+  static void handle_out_buf(OmxEncoder *e, OMX_BUFFERHEADERTYPE *out_buf);
+
   pthread_mutex_t lock;
   int width, height, fps;
-  const char* path;
   char vid_path[1024];
   char lock_path[1024];
-  bool open;
+  bool is_open;
   bool dirty;
   int counter;
   int segment;
@@ -67,4 +79,4 @@ private:
 
   bool downscale;
   uint8_t *y_ptr2, *u_ptr2, *v_ptr2;
-}
+};

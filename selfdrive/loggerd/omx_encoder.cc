@@ -26,7 +26,7 @@
 
 // ***** OMX callback functions *****
 
-static void wait_for_state(EncoderState *s, OMX_STATETYPE state) {
+void OmxEncoder::wait_for_state(OMX_STATETYPE state) {
   pthread_mutex_lock(&this->state_lock);
   while (this->state != state) {
     pthread_cond_wait(&this->state_cv, &this->state_lock);
@@ -34,18 +34,24 @@ static void wait_for_state(EncoderState *s, OMX_STATETYPE state) {
   pthread_mutex_unlock(&this->state_lock);
 }
 
-static OMX_ERRORTYPE event_handler(OMX_HANDLETYPE component, OMX_PTR app_data, OMX_EVENTTYPE event,
+static OMX_CALLBACKTYPE omx_callbacks = {
+  .EventHandler = OmxEncoder::event_handler,
+  .EmptyBufferDone = OmxEncoder::empty_buffer_done,
+  .FillBufferDone = OmxEncoder::fill_buffer_done,
+};
+
+OMX_ERRORTYPE OmxEncoder::event_handler(OMX_HANDLETYPE component, OMX_PTR app_data, OMX_EVENTTYPE event,
                                    OMX_U32 data1, OMX_U32 data2, OMX_PTR event_data) {
-  EncoderState *s = (EncoderState*)app_data;
+  OmxEncoder *e = (OmxEncoder*)app_data;
 
   switch (event) {
   case OMX_EventCmdComplete:
     assert(data1 == OMX_CommandStateSet);
     LOG("set state event 0x%x", data2);
-    pthread_mutex_lock(&this->state_lock);
-    this->state = (OMX_STATETYPE)data2;
-    pthread_cond_broadcast(&this->state_cv);
-    pthread_mutex_unlock(&this->state_lock);
+    pthread_mutex_lock(&e->state_lock);
+    e->state = (OMX_STATETYPE)data2;
+    pthread_cond_broadcast(&e->state_cv);
+    pthread_mutex_unlock(&e->state_lock);
     break;
   case OMX_EventError:
     LOGE("OMX error 0x%08x", data1);
@@ -60,27 +66,21 @@ static OMX_ERRORTYPE event_handler(OMX_HANDLETYPE component, OMX_PTR app_data, O
   return OMX_ErrorNone;
 }
 
-static OMX_ERRORTYPE empty_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
-                                       OMX_BUFFERHEADERTYPE *buffer) {
+OMX_ERRORTYPE OmxEncoder::empty_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
+                                                   OMX_BUFFERHEADERTYPE *buffer) {
   // printf("empty_buffer_done\n");
-  EncoderState *s = (EncoderState*)app_data;
-  queue_push(&this->free_in, (void*)buffer);
+  OmxEncoder *e = (OmxEncoder*)app_data;
+  queue_push(&e->free_in, (void*)buffer);
   return OMX_ErrorNone;
 }
 
-static OMX_ERRORTYPE fill_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
-                                      OMX_BUFFERHEADERTYPE *buffer) {
+OMX_ERRORTYPE OmxEncoder::fill_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
+                                                  OMX_BUFFERHEADERTYPE *buffer) {
   // printf("fill_buffer_done\n");
-  EncoderState *s = (EncoderState*)app_data;
-  queue_push(&this->done_out, (void*)buffer);
+  OmxEncoder *e = (OmxEncoder*)app_data;
+  queue_push(&e->done_out, (void*)buffer);
   return OMX_ErrorNone;
 }
-
-static OMX_CALLBACKTYPE omx_callbacks = {
-  .EventHandler = event_handler,
-  .EmptyBufferDone = empty_buffer_done,
-  .FillBufferDone = fill_buffer_done,
-};
 
 #define PORT_INDEX_IN 0
 #define PORT_INDEX_OUT 1
@@ -165,11 +165,17 @@ OmxEncoder::OmxEncoder(const char* filename, int width, int height, int fps, int
   this->width = width;
   this->height = height;
   this->fps = fps;
-  mutex_init_reentrant(this->lock);
+  this->segment = -1;
+  this->state = OMX_StateLoaded;
+  this->codec_config = NULL;
+  this->remuxing = !h265;
 
-  if (!h265) {
-    this->remuxing = true;
-  }
+  queue_init(&this->free_in);
+  queue_init(&this->done_out);
+
+  mutex_init_reentrant(&this->lock);
+  pthread_mutex_init(&this->state_lock, NULL);
+  pthread_cond_init(&this->state_cv, NULL);
 
   if (downscale) {
     this->downscale = true;
@@ -178,24 +184,12 @@ OmxEncoder::OmxEncoder(const char* filename, int width, int height, int fps, int
     this->v_ptr2 = (uint8_t *)malloc(this->width*this->height/4);
   }
 
-  this->segment = -1;
-
-  this->state = OMX_StateLoaded;
-
-  this->codec_config = NULL;
-
-  queue_init(&this->free_in);
-  queue_init(&this->done_out);
-
-  pthread_mutex_init(&this->state_lock, NULL);
-  pthread_cond_init(&this->state_cv, NULL);
-
   if (h265) {
     err = OMX_GetHandle(&this->handle, (OMX_STRING)"OMX.qcom.video.encoder.hevc",
-                        s, &omx_callbacks);
+                        this, &omx_callbacks);
   } else {
     err = OMX_GetHandle(&this->handle, (OMX_STRING)"OMX.qcom.video.encoder.avc",
-                        s, &omx_callbacks);
+                        this, &omx_callbacks);
   }
   if (err != OMX_ErrorNone) {
     LOGE("error getting codec: %x", err);
@@ -345,24 +339,24 @@ OmxEncoder::OmxEncoder(const char* filename, int width, int height, int fps, int
 
   this->in_buf_headers = (OMX_BUFFERHEADERTYPE **)calloc(this->num_in_bufs, sizeof(OMX_BUFFERHEADERTYPE*));
   for (int i=0; i<this->num_in_bufs; i++) {
-    err = OMX_AllocateBuffer(this->handle, &this->in_buf_headers[i], PORT_INDEX_IN, s,
+    err = OMX_AllocateBuffer(this->handle, &this->in_buf_headers[i], PORT_INDEX_IN, this,
                              in_port.nBufferSize);
     assert(err == OMX_ErrorNone);
   }
 
   this->out_buf_headers = (OMX_BUFFERHEADERTYPE **)calloc(this->num_out_bufs, sizeof(OMX_BUFFERHEADERTYPE*));
   for (int i=0; i<this->num_out_bufs; i++) {
-    err = OMX_AllocateBuffer(this->handle, &this->out_buf_headers[i], PORT_INDEX_OUT, s,
+    err = OMX_AllocateBuffer(this->handle, &this->out_buf_headers[i], PORT_INDEX_OUT, this,
                              out_port.nBufferSize);
     assert(err == OMX_ErrorNone);
   }
 
-  wait_for_state(s, OMX_StateIdle);
+  wait_for_state(OMX_StateIdle);
 
   err = OMX_SendCommand(this->handle, OMX_CommandStateSet, OMX_StateExecuting, NULL);
   assert(err == OMX_ErrorNone);
 
-  wait_for_state(s, OMX_StateExecuting);
+  wait_for_state(OMX_StateExecuting);
 
   // give omx all the output buffers
   for (int i = 0; i < this->num_out_bufs; i++) {
@@ -377,41 +371,41 @@ OmxEncoder::OmxEncoder(const char* filename, int width, int height, int fps, int
   }
 }
 
-static void handle_out_buf(EncoderState *s, OMX_BUFFERHEADERTYPE *out_buf) {
+void OmxEncoder::handle_out_buf(OmxEncoder *e, OMX_BUFFERHEADERTYPE *out_buf) {
   int err;
   uint8_t *buf_data = out_buf->pBuffer + out_buf->nOffset;
 
   if (out_buf->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
-    if (this->codec_config_len < out_buf->nFilledLen) {
-      this->codec_config = (uint8_t *)realloc(this->codec_config, out_buf->nFilledLen);
+    if (e->codec_config_len < out_buf->nFilledLen) {
+      e->codec_config = (uint8_t *)realloc(e->codec_config, out_buf->nFilledLen);
     }
-    this->codec_config_len = out_buf->nFilledLen;
-    memcpy(this->codec_config, buf_data, out_buf->nFilledLen);
+    e->codec_config_len = out_buf->nFilledLen;
+    memcpy(e->codec_config, buf_data, out_buf->nFilledLen);
 #ifdef QCOM2
     out_buf->nTimeStamp = 0;
 #endif
   }
 
-  if (this->of) {
+  if (e->of) {
     //printf("write %d flags 0x%x\n", out_buf->nFilledLen, out_buf->nFlags);
-    fwrite(buf_data, out_buf->nFilledLen, 1, this->of);
+    fwrite(buf_data, out_buf->nFilledLen, 1, e->of);
   }
 
-  if (this->remuxing) {
-    if (!this->wrote_codec_config && this->codec_config_len > 0) {
-      if (this->codec_ctx->extradata_size < this->codec_config_len) {
-        this->codec_ctx->extradata = (uint8_t *)realloc(this->codec_ctx->extradata, this->codec_config_len + AV_INPUT_BUFFER_PADDING_SIZE);
+  if (e->remuxing) {
+    if (!e->wrote_codec_config && e->codec_config_len > 0) {
+      if (e->codec_ctx->extradata_size < e->codec_config_len) {
+        e->codec_ctx->extradata = (uint8_t *)realloc(e->codec_ctx->extradata, e->codec_config_len + AV_INPUT_BUFFER_PADDING_SIZE);
       }
-      this->codec_ctx->extradata_size = this->codec_config_len;
-      memcpy(this->codec_ctx->extradata, this->codec_config, this->codec_config_len);
-      memset(this->codec_ctx->extradata + this->codec_ctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+      e->codec_ctx->extradata_size = e->codec_config_len;
+      memcpy(e->codec_ctx->extradata, e->codec_config, e->codec_config_len);
+      memset(e->codec_ctx->extradata + e->codec_ctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
-      err = avcodec_parameters_from_context(this->out_stream->codecpar, this->codec_ctx);
+      err = avcodec_parameters_from_context(e->out_stream->codecpar, e->codec_ctx);
       assert(err >= 0);
-      err = avformat_write_header(this->ofmt_ctx, NULL);
+      err = avformat_write_header(e->ofmt_ctx, NULL);
       assert(err >= 0);
 
-      this->wrote_codec_config = true;
+      e->wrote_codec_config = true;
     }
 
     if (out_buf->nTimeStamp > 0) {
@@ -424,14 +418,14 @@ static void handle_out_buf(EncoderState *s, OMX_BUFFERHEADERTYPE *out_buf) {
       pkt.size = out_buf->nFilledLen;
 
       enum AVRounding rnd = static_cast<enum AVRounding>(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
-      pkt.pts = pkt.dts = av_rescale_q_rnd(out_buf->nTimeStamp, in_timebase, this->ofmt_ctx->streams[0]->time_base, rnd);
-      pkt.duration = av_rescale_q(50*1000, in_timebase, this->ofmt_ctx->streams[0]->time_base);
+      pkt.pts = pkt.dts = av_rescale_q_rnd(out_buf->nTimeStamp, in_timebase, e->ofmt_ctx->streams[0]->time_base, rnd);
+      pkt.duration = av_rescale_q(50*1000, in_timebase, e->ofmt_ctx->streams[0]->time_base);
 
       if (out_buf->nFlags & OMX_BUFFERFLAG_SYNCFRAME) {
         pkt.flags |= AV_PKT_FLAG_KEY;
       }
 
-      err = av_write_frame(this->ofmt_ctx, &pkt);
+      err = av_write_frame(e->ofmt_ctx, &pkt);
       if (err < 0) { LOGW("ts encoder write issue"); }
 
       av_free_packet(&pkt);
@@ -444,7 +438,7 @@ static void handle_out_buf(EncoderState *s, OMX_BUFFERHEADERTYPE *out_buf) {
     out_buf->nTimeStamp = 0;
   }
 #endif
-  err = OMX_FillThisBuffer(this->handle, out_buf);
+  err = OMX_FillThisBuffer(e->handle, out_buf);
   assert(err == OMX_ErrorNone);
 }
 
@@ -454,7 +448,7 @@ int OmxEncoder::encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const u
   int err;
   pthread_mutex_lock(&this->lock);
 
-  if (!this->open) {
+  if (!this->is_open) {
     pthread_mutex_unlock(&this->lock);
     return -1;
   }
@@ -465,12 +459,6 @@ int OmxEncoder::encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const u
   OMX_BUFFERHEADERTYPE* in_buf = (OMX_BUFFERHEADERTYPE *)queue_pop(&this->free_in);
   //pthread_mutex_lock(&this->lock);
 
-  // if (this->rotating) {
-  //   encoder_close(s);
-  //   encoder_open(s, this->next_path);
-  //   this->segment = this->next_segment;
-  //   this->rotating = false;
-  // }
   int ret = this->counter;
 
   uint8_t *in_buf_ptr = in_buf->pBuffer;
@@ -520,7 +508,7 @@ int OmxEncoder::encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const u
     if (!out_buf) {
       break;
     }
-    handle_out_buf(s, out_buf);
+    handle_out_buf(this, out_buf);
   }
 
   this->dirty = true;
@@ -535,7 +523,7 @@ int OmxEncoder::encode_frame(const uint8_t *y_ptr, const uint8_t *u_ptr, const u
   return ret;
 }
 
-void OmxEncoder::open(const char* path, int segment) {
+void OmxEncoder::encoder_open(const char* path, int segment) {
   int err;
 
   pthread_mutex_lock(&this->lock);
@@ -585,18 +573,18 @@ void OmxEncoder::open(const char* path, int segment) {
   assert(lock_fd >= 0);
   close(lock_fd);
 
-  this->open = true;
+  this->is_open = true;
   this->counter = 0;
 
   pthread_mutex_unlock(&this->lock);
 }
 
-void OmxEncoder::close() {
+void OmxEncoder::encoder_close() {
   int err;
 
   pthread_mutex_lock(&this->lock);
 
-  if (this->open) {
+  if (this->is_open) {
     if (this->dirty) {
       // drain output only if there could be frames in the encoder
 
@@ -612,7 +600,7 @@ void OmxEncoder::close() {
       while (true) {
         OMX_BUFFERHEADERTYPE *out_buf = (OMX_BUFFERHEADERTYPE *)queue_pop(&this->done_out);
 
-        handle_out_buf(s, out_buf);
+        handle_out_buf(this, out_buf);
 
         if (out_buf->nFlags & OMX_BUFFERFLAG_EOS) {
           break;
@@ -631,7 +619,7 @@ void OmxEncoder::close() {
     }
     unlink(this->lock_path);
   }
-  this->open = false;
+  this->is_open = false;
 
   pthread_mutex_unlock(&this->lock);
 }
@@ -639,12 +627,12 @@ void OmxEncoder::close() {
 OmxEncoder::~OmxEncoder() {
   int err;
 
-  assert(!this->open);
+  assert(!this->is_open);
 
   err = OMX_SendCommand(this->handle, OMX_CommandStateSet, OMX_StateIdle, NULL);
   assert(err == OMX_ErrorNone);
 
-  wait_for_state(s, OMX_StateIdle);
+  wait_for_state(OMX_StateIdle);
 
   err = OMX_SendCommand(this->handle, OMX_CommandStateSet, OMX_StateLoaded, NULL);
   assert(err == OMX_ErrorNone);
@@ -661,7 +649,7 @@ OmxEncoder::~OmxEncoder() {
   }
   free(this->out_buf_headers);
 
-  wait_for_state(s, OMX_StateLoaded);
+  wait_for_state(OMX_StateLoaded);
 
   err = OMX_FreeHandle(this->handle);
   assert(err == OMX_ErrorNone);
